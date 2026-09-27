@@ -1,0 +1,17 @@
+[package]
+name = "tui-mahjongg"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal clone of GNOME Mahjongg (tile-matching solitaire)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "mahjongg"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true

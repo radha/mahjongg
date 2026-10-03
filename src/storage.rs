@@ -3,20 +3,37 @@
 //! `~/.local/share`).
 
 use std::fs;
+use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::game::Game;
+use crate::game::{Game, TileState};
 use crate::map::{Map, Slot};
 use crate::theme::{Background, TileTheme};
 
 const APP_DIR: &str = "tui-mahjongg";
 
+#[cfg(not(test))]
 fn base_dir(var: &str, fallback: &str) -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir).join(APP_DIR));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback).join(APP_DIR))
+}
+
+/// Tests never touch the real config: each test thread gets its own empty directory.
+#[cfg(test)]
+fn base_dir(_var: &str, _fallback: &str) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static DIR: PathBuf = std::env::temp_dir().join(format!(
+            "{APP_DIR}-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+    }
+    Some(DIR.with(PathBuf::clone))
 }
 
 fn config_path(name: &str) -> Option<PathBuf> {
@@ -27,12 +44,18 @@ fn data_path(name: &str) -> Option<PathBuf> {
     base_dir("XDG_DATA_HOME", ".local/share").map(|d| d.join(name))
 }
 
-fn write_file(path: Option<PathBuf>, contents: &str) {
-    let Some(path) = path else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, contents);
+/// Write via a temporary file and rename, so a crash never leaves a truncated file.
+fn write_file(path: Option<PathBuf>, contents: &str) -> io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let write = || {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, contents)?;
+        fs::rename(&tmp, &path)
+    };
+    write().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
 // ----- Settings -------------------------------------------------------------
@@ -121,7 +144,7 @@ impl Settings {
         settings
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> io::Result<()> {
         let text = format!(
             "layout={}\nprogression={}\nbackground={}\ntheme={}\n",
             self.layout,
@@ -129,7 +152,7 @@ impl Settings {
             self.background.key(),
             self.theme.key()
         );
-        write_file(config_path("settings"), &text);
+        write_file(config_path("settings"), &text)
     }
 }
 
@@ -137,7 +160,7 @@ impl Settings {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
-    /// ISO 8601 UTC timestamp.
+    /// ISO 8601 local timestamp with UTC offset.
     pub date: String,
     /// Layout score name (e.g. "easy" for Turtle).
     pub name: String,
@@ -149,6 +172,8 @@ pub struct HistoryEntry {
 pub struct History {
     path: Option<PathBuf>,
     pub entries: Vec<HistoryEntry>,
+    /// Lines this version can't parse, kept so saving never drops them.
+    unparsed: Vec<String>,
 }
 
 impl History {
@@ -158,30 +183,54 @@ impl History {
             .as_ref()
             .and_then(|p| fs::read_to_string(p).ok())
             .unwrap_or_default();
-        let entries = text
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(4, ' ');
+        Self::parse(path, &text)
+    }
+
+    fn parse(path: Option<PathBuf>, text: &str) -> Self {
+        let mut entries = vec![];
+        let mut unparsed = vec![];
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let mut parts = line.splitn(4, ' ');
+            let entry = (|| {
                 Some(HistoryEntry {
                     date: parts.next()?.to_string(),
                     name: parts.next()?.to_string(),
                     duration: parts.next()?.parse().ok()?,
                     player: parts.next().unwrap_or("").to_string(),
                 })
-            })
-            .collect();
-        History { path, entries }
+            })();
+            match entry {
+                Some(e) => entries.push(e),
+                None => unparsed.push(line.to_string()),
+            }
+        }
+        History {
+            path,
+            entries,
+            unparsed,
+        }
     }
 
-    fn save(&self) {
-        let text: String = self
-            .entries
-            .iter()
-            .map(|e| format!("{} {} {} {}\n", e.date, e.name, e.duration, e.player))
-            .collect();
-        write_file(self.path.clone(), &text);
+    fn to_text(&self) -> String {
+        let mut text = String::new();
+        for line in &self.unparsed {
+            text.push_str(line);
+            text.push('\n');
+        }
+        for e in &self.entries {
+            text.push_str(&format!(
+                "{} {} {} {}\n",
+                e.date, e.name, e.duration, e.player
+            ));
+        }
+        text
     }
 
+    pub fn save(&self) -> io::Result<()> {
+        write_file(self.path.clone(), &self.to_text())
+    }
+
+    /// Record a finished game. Call [`History::save`] afterwards.
     pub fn add(&mut self, name: &str, duration: u32) -> HistoryEntry {
         let entry = HistoryEntry {
             date: now_iso8601(),
@@ -190,13 +239,13 @@ impl History {
             player: player_name(),
         };
         self.entries.push(entry.clone());
-        self.save();
         entry
     }
 
+    /// Remove every score. Call [`History::save`] afterwards.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.save();
+        self.unparsed.clear();
     }
 
     /// Entries for a layout, best (shortest) time first.
@@ -222,11 +271,34 @@ fn player_name() -> String {
         .unwrap_or_else(|_| "Player".into())
 }
 
+/// Seconds east of UTC for the local time zone at `secs` since the epoch.
+#[cfg(unix)]
+fn utc_offset(secs: i64) -> i64 {
+    let time = secs as libc::time_t;
+    // SAFETY: `tm` is plain data, and localtime_r only writes into it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+#[cfg(not(unix))]
+fn utc_offset(_secs: i64) -> i64 {
+    0
+}
+
+/// The current local time, e.g. `2026-10-03T16:16:00+05:30`.
 fn now_iso8601() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    format_iso8601(secs, utc_offset(secs))
+}
+
+fn format_iso8601(utc_secs: i64, offset: i64) -> String {
+    let secs = utc_secs + offset;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil-from-days (Howard Hinnant).
     let z = days + 719_468;
@@ -238,8 +310,15 @@ fn now_iso8601() -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
+    let zone = if offset == 0 {
+        "Z".to_string()
+    } else {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let m = offset.abs() / 60;
+        format!("{sign}{:02}:{:02}", m / 60, m % 60)
+    };
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{zone}",
         rem / 3600,
         rem % 3600 / 60,
         rem % 60
@@ -251,45 +330,58 @@ fn now_iso8601() -> String {
 pub struct SavedGame {
     pub map: String,
     pub seed: u64,
-    pub clock: f64,
+    pub clock: Duration,
     pub current_move: u32,
-    pub tiles: Vec<(Slot, i32, bool, u32)>,
+    pub tiles: Vec<TileState>,
 }
 
-pub fn write_save(game: &Game) {
+/// Only dealt games are saved, so every tile has a number.
+pub fn write_save(game: &Game) -> io::Result<()> {
     let mut text = format!(
         "map={}\nseed={}\nclock={}\nmove={}\n",
         game.map.name,
         game.seed,
-        game.elapsed(),
+        game.elapsed().as_secs_f64(),
         game.current_move()
     );
     for t in &game.tiles {
+        let Some(number) = t.number else {
+            return Ok(());
+        };
         text.push_str(&format!(
             "tile={} {} {} {} {} {}\n",
             t.slot.x,
             t.slot.y,
             t.slot.layer,
-            t.number,
+            number,
             u8::from(t.visible),
             t.mv
         ));
     }
-    write_file(data_path("gamesave"), &text);
+    write_file(data_path("gamesave"), &text)
 }
 
-pub fn delete_save() {
-    if let Some(path) = data_path("gamesave") {
-        let _ = fs::remove_file(path);
+pub fn delete_save() -> io::Result<()> {
+    let Some(path) = data_path("gamesave") else {
+        return Ok(());
+    };
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+        }
+        _ => Ok(()),
     }
 }
 
 pub fn load_save(maps: &[Map]) -> Option<SavedGame> {
-    let text = fs::read_to_string(data_path("gamesave")?).ok()?;
+    parse_save(&fs::read_to_string(data_path("gamesave")?).ok()?, maps)
+}
+
+fn parse_save(text: &str, maps: &[Map]) -> Option<SavedGame> {
     let mut save = SavedGame {
         map: String::new(),
         seed: 0,
-        clock: 0.0,
+        clock: Duration::ZERO,
         current_move: 1,
         tiles: vec![],
     };
@@ -298,19 +390,22 @@ pub fn load_save(maps: &[Map]) -> Option<SavedGame> {
         match key {
             "map" => save.map = value.to_string(),
             "seed" => save.seed = value.parse().ok()?,
-            "clock" => save.clock = value.parse().ok()?,
+            // Rejects negative, NaN and infinite times.
+            "clock" => save.clock = Duration::try_from_secs_f64(value.parse().ok()?).ok()?,
             "move" => save.current_move = value.parse().ok()?,
             "tile" => {
-                let v: Vec<i64> = value.split(' ').filter_map(|s| s.parse().ok()).collect();
-                if v.len() != 6 {
-                    return None;
-                }
-                let slot = Slot {
-                    x: v[0] as i32,
-                    y: v[1] as i32,
-                    layer: v[2] as i32,
-                };
-                save.tiles.push((slot, v[3] as i32, v[4] != 0, v[5] as u32));
+                let mut v = value.split(' ');
+                let mut next = || v.next();
+                save.tiles.push(TileState {
+                    slot: Slot {
+                        x: next()?.parse().ok()?,
+                        y: next()?.parse().ok()?,
+                        layer: next()?.parse().ok()?,
+                    },
+                    number: next()?.parse().ok()?,
+                    visible: next()?.parse::<u8>().ok()? != 0,
+                    mv: next()?.parse().ok()?,
+                });
             }
             _ => {}
         }
@@ -320,8 +415,8 @@ pub fn load_save(maps: &[Map]) -> Option<SavedGame> {
         && map
             .slots
             .iter()
-            .all(|s| save.tiles.iter().any(|(t, ..)| t == s))
-        && save.tiles.iter().any(|(_, _, visible, _)| *visible);
+            .all(|s| save.tiles.iter().any(|t| t.slot == *s))
+        && save.tiles.iter().any(|t| t.visible);
     valid.then_some(save)
 }
 
@@ -329,11 +424,75 @@ pub fn load_save(maps: &[Map]) -> Option<SavedGame> {
 mod tests {
     use super::*;
 
+    use crate::map::load_maps;
+
     #[test]
     fn iso_date_format() {
         let d = now_iso8601();
-        assert_eq!(d.len(), 20);
-        assert!(d.ends_with('Z') && d.as_bytes()[10] == b'T');
-        assert!(d.starts_with("20"));
+        assert!(d.len() == 20 || d.len() == 25, "{d}");
+        assert!(d.as_bytes()[10] == b'T' && d.starts_with("20"));
+        assert_eq!(format_iso8601(0, 0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_iso8601(1_790_000_000, 19_800),
+            "2026-09-21T19:43:20+05:30"
+        );
+        assert_eq!(format_iso8601(0, -3_600), "1969-12-31T23:00:00-01:00");
+    }
+
+    #[test]
+    fn save_round_trip() {
+        let maps = load_maps();
+        let mut game = Game::new(maps[2].clone());
+        game.generate(Some(9));
+        let (a, b) = game.solution[0];
+        game.remove_pair(a, b);
+        write_save(&game).unwrap();
+
+        let save = load_save(&maps).unwrap();
+        let mut restored = Game::new(maps[2].clone());
+        restored.restore(save.seed, save.current_move, save.clock, &save.tiles);
+        assert!(restored.is_valid_deal() && restored.paused());
+        assert_eq!(restored.current_move(), 2);
+        for (x, y) in game.tiles.iter().zip(&restored.tiles) {
+            assert_eq!((x.number, x.visible, x.mv), (y.number, y.visible, y.mv));
+        }
+
+        delete_save().unwrap();
+        assert!(load_save(&maps).is_none());
+        delete_save().unwrap();
+    }
+
+    #[test]
+    fn corrupt_clock_rejected() {
+        let maps = load_maps();
+        let mut game = Game::new(maps[0].clone());
+        game.generate(Some(1));
+        let (a, b) = game.solution[0];
+        game.remove_pair(a, b);
+        write_save(&game).unwrap();
+        let text = fs::read_to_string(data_path("gamesave").unwrap()).unwrap();
+        assert!(parse_save(&text, &maps).is_some());
+        for bad in ["NaN", "-5", "inf"] {
+            let edited: String = text
+                .lines()
+                .map(|l| {
+                    if l.starts_with("clock=") {
+                        format!("clock={bad}\n")
+                    } else {
+                        format!("{l}\n")
+                    }
+                })
+                .collect();
+            assert!(parse_save(&edited, &maps).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn history_keeps_unparsed_lines() {
+        let text = "# from a newer version\n2026-01-01T00:00:00Z easy 300 Ann Lee\n";
+        let h = History::parse(None, text);
+        assert_eq!(h.entries.len(), 1);
+        assert_eq!(h.entries[0].player, "Ann Lee");
+        assert_eq!(h.to_text(), text);
     }
 }

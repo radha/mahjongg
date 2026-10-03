@@ -1,5 +1,6 @@
 //! Application state: the current game plus menus, dialogs, settings and input.
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -41,6 +42,7 @@ pub enum Action {
     ScoresLayout(isize),
     ClearScores,
     ConfirmClearScores,
+    CancelClearScores,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +159,8 @@ pub struct App {
     pub geometry: Option<Geometry>,
     pub mouse: Option<(u16, u16)>,
     pub quit: bool,
+    /// First error hit while saving settings, scores or the game; reported on exit.
+    pub storage_error: Option<String>,
     auto_paused: bool,
     recorded: bool,
     last_click: Option<(Instant, u16, u16)>,
@@ -188,6 +192,7 @@ impl App {
             geometry: None,
             mouse: None,
             quit: false,
+            storage_error: None,
             auto_paused: false,
             recorded: false,
             last_click: None,
@@ -205,6 +210,9 @@ impl App {
             app.game
                 .restore(save.seed, save.current_move, save.clock, &save.tiles);
             app.restored = app.game.is_valid_deal();
+            if app.restored {
+                app.settings.layout = save.map;
+            }
         }
         if !app.restored {
             let rotate = app.settings.progression == Progression::Random;
@@ -215,16 +223,39 @@ impl App {
 
     /// Save the game in progress (GNOME resumes it next launch).
     pub fn shutdown(&mut self) {
-        if self.game.started() && !self.game.inspecting() && self.game.can_move() {
-            storage::write_save(&self.game);
-        } else {
-            storage::delete_save();
-            if self.game.inspecting() {
-                let next = self.next_map_index();
-                self.settings.layout = self.maps[next].name.clone();
-            }
+        self.persist();
+        if self.game.inspecting() {
+            let next = self.next_map_index();
+            self.settings.layout = self.maps[next].name.clone();
         }
-        self.settings.save();
+        self.save_settings();
+    }
+
+    /// Keep the save file in step with the game, so nothing is lost if the
+    /// terminal is closed or the process is killed.
+    fn persist(&mut self) {
+        let result = if self.game.started() && !self.game.inspecting() && self.game.can_move() {
+            storage::write_save(&self.game)
+        } else {
+            storage::delete_save()
+        };
+        self.record(result);
+    }
+
+    fn save_settings(&mut self) {
+        let result = self.settings.save();
+        self.record(result);
+    }
+
+    fn save_history(&mut self) {
+        let result = self.history.save();
+        self.record(result);
+    }
+
+    fn record(&mut self, result: io::Result<()>) {
+        if let Err(e) = result {
+            self.storage_error.get_or_insert(e.to_string());
+        }
     }
 
     fn next_map_index(&mut self) -> usize {
@@ -251,16 +282,16 @@ impl App {
         };
         self.map_index = index;
         self.settings.layout = self.maps[index].name.clone();
-        self.settings.save();
+        self.save_settings();
         self.game = Game::new(self.maps[index].clone());
         self.game.generate(None);
-        storage::delete_save();
+        self.persist();
         self.reset_session();
     }
 
     fn restart_game(&mut self) {
         self.game.restart();
-        storage::delete_save();
+        self.persist();
         self.reset_session();
     }
 
@@ -300,7 +331,8 @@ impl App {
             self.auto_pause();
         }
         self.menu = None;
-        let focus = Self::buttons_for(&kind, self)
+        let focus = self
+            .buttons_for(&kind)
             .iter()
             .position(|b| b.kind == ButtonKind::Suggested)
             .unwrap_or(0);
@@ -320,6 +352,17 @@ impl App {
             page: MenuPage::Main,
             index: 0,
         });
+    }
+
+    /// Hint is available during play; with no moves left it reopens the
+    /// "No Moves Left" choices instead.
+    pub fn can_hint(&self) -> bool {
+        !self.game.paused() && !self.game.inspecting() && !self.game.autoplaying()
+    }
+
+    /// Menus and dialogs are modal.
+    pub fn overlay_open(&self) -> bool {
+        self.menu.is_some() || self.dialog.is_some()
     }
 
     pub fn pause_overlay_visible(&self) -> bool {
@@ -429,12 +472,12 @@ impl App {
 
     pub fn buttons(&self) -> Vec<Button> {
         match &self.dialog {
-            Some(d) => Self::buttons_for(&d.kind, self),
+            Some(d) => self.buttons_for(&d.kind),
             None => vec![],
         }
     }
 
-    fn buttons_for(kind: &Dialog, app: &App) -> Vec<Button> {
+    fn buttons_for(&self, kind: &Dialog) -> Vec<Button> {
         use ButtonKind::*;
         let b = |label, action, kind| Button {
             label,
@@ -467,14 +510,14 @@ impl App {
             }
             Dialog::Scores { .. } => {
                 let mut v = vec![];
-                if !app.history.entries.is_empty() {
+                if !self.history.entries.is_empty() {
                     v.push(b("Clear Scores", Action::ClearScores, Destructive));
                 }
                 v.push(b("Close", Action::CloseDialog, Suggested));
                 v
             }
             Dialog::ClearScores { .. } => vec![
-                b("Cancel", Action::CloseDialog, Suggested),
+                b("Cancel", Action::CancelClearScores, Suggested),
                 b("Clear All", Action::ConfirmClearScores, Destructive),
             ],
             Dialog::Rules | Dialog::Shortcuts | Dialog::About => {
@@ -510,8 +553,15 @@ impl App {
                 }
             }
             Action::Hint => {
-                if !self.game.paused() && self.game.moves_left() > 0 {
+                if !self.can_hint() {
+                    return;
+                }
+                if self.game.can_move() {
                     self.game.show_hint();
+                } else {
+                    // Stuck: offer the reshuffle / new game choices again.
+                    let can_shuffle = self.game.can_shuffle();
+                    self.open_dialog(Dialog::NoMoves { can_shuffle });
                 }
             }
             Action::TogglePause => {
@@ -531,16 +581,19 @@ impl App {
             Action::OpenMenu => self.open_menu(),
             Action::MenuActivate(index) => self.menu_activate(index),
             Action::MenuBack => {
-                if let Some(menu) = &mut self.menu {
-                    let back_to = match menu.page {
-                        MenuPage::Layout => 4,
-                        MenuPage::Progression => 5,
-                        MenuPage::Appearance => 6,
-                        MenuPage::Main => 0,
-                    };
-                    menu.page = MenuPage::Main;
-                    menu.index = back_to;
-                }
+                let Some(page) = self.menu.as_ref().map(|m| m.page) else {
+                    return;
+                };
+                // Return to the submenu entry we came from.
+                let index = self
+                    .menu_items(MenuPage::Main)
+                    .iter()
+                    .position(|i| matches!(i, MenuItem::Submenu { page: p, .. } if *p == page))
+                    .unwrap_or(0);
+                self.menu = Some(Menu {
+                    page: MenuPage::Main,
+                    index,
+                });
             }
             Action::SetLayout(i) => {
                 self.menu = None;
@@ -559,17 +612,17 @@ impl App {
             }
             Action::SetProgression(p) => {
                 self.settings.progression = p;
-                self.settings.save();
+                self.save_settings();
                 self.close_overlays();
             }
             Action::SetBackground(b) => {
                 self.settings.background = b;
-                self.settings.save();
+                self.save_settings();
                 self.close_overlays();
             }
             Action::SetTheme(t) => {
                 self.settings.theme = t;
-                self.settings.save();
+                self.save_settings();
                 self.close_overlays();
             }
             Action::Rules => self.open_dialog(Dialog::Rules),
@@ -600,26 +653,38 @@ impl App {
                 }
             }
             Action::ClearScores => {
-                let layout = self.map_index;
-                self.dialog = None;
-                self.open_dialog(Dialog::ClearScores { layout });
-            }
-            Action::ConfirmClearScores => {
-                self.history.clear();
+                // Remember which layout's table was showing, to return to it.
                 let layout = match &self.dialog {
                     Some(DialogState {
-                        kind: Dialog::ClearScores { layout },
+                        kind: Dialog::Scores { layout, .. },
                         ..
                     }) => *layout,
                     _ => self.map_index,
                 };
-                self.dialog = None;
-                self.open_dialog(Dialog::Scores {
-                    layout,
-                    completed: None,
-                });
+                self.open_dialog(Dialog::ClearScores { layout });
             }
+            Action::ConfirmClearScores => {
+                self.history.clear();
+                self.save_history();
+                self.back_to_scores();
+            }
+            Action::CancelClearScores => self.back_to_scores(),
         }
+    }
+
+    /// Leave the "Clear All Scores?" confirmation for the scores table it came from.
+    fn back_to_scores(&mut self) {
+        let layout = match &self.dialog {
+            Some(DialogState {
+                kind: Dialog::ClearScores { layout },
+                ..
+            }) => *layout,
+            _ => self.map_index,
+        };
+        self.open_dialog(Dialog::Scores {
+            layout,
+            completed: None,
+        });
     }
 
     fn apply_layout(&mut self, index: usize) {
@@ -664,13 +729,13 @@ impl App {
 
     /// Mirrors GNOME's `moved` handler: record a win, or offer help when stuck.
     fn after_move(&mut self) {
+        self.persist();
         if self.game.complete() {
             if !self.recorded {
                 self.recorded = true;
-                let entry = self
-                    .history
-                    .add(&self.game.map.score_name, self.game.elapsed() as u32);
-                storage::delete_save();
+                let secs = u32::try_from(self.game.elapsed().as_secs()).unwrap_or(u32::MAX);
+                let entry = self.history.add(&self.game.map.score_name, secs);
+                self.save_history();
                 let layout = self.map_index;
                 self.open_dialog(Dialog::Scores {
                     layout,
@@ -795,20 +860,17 @@ impl App {
     /// Cycle the cursor through free (selectable) tiles in reading order.
     fn cycle_cursor(&mut self, forward: bool) {
         self.cursor_visible = true;
+        let key = |i: usize| {
+            let s = self.game.tiles[i].slot;
+            (s.y, s.x, s.layer)
+        };
         let mut free: Vec<usize> = (0..self.game.tiles.len())
             .filter(|&i| self.game.selectable(i))
             .collect();
         if free.is_empty() {
             return;
         }
-        free.sort_by_key(|&i| {
-            let s = self.game.tiles[i].slot;
-            (s.y, s.x, s.layer)
-        });
-        let key = |i: usize| {
-            let s = self.game.tiles[i].slot;
-            (s.y, s.x, s.layer)
-        };
+        free.sort_by_key(|&i| key(i));
         let next = match self.cursor {
             None => free[0],
             Some(c) => {
@@ -833,6 +895,12 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Quitting works everywhere, including menus and dialogs. The game is saved.
+        if ctrl && matches!(key.code, KeyCode::Char('q' | 'c')) {
+            self.perform(Action::Quit);
+            return;
+        }
         if self.menu.is_some() {
             self.menu_key(key);
             return;
@@ -842,11 +910,8 @@ impl App {
             return;
         }
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let action = match key.code {
-            KeyCode::Char('q') if ctrl => Some(Action::Quit),
-            KeyCode::Char('w') if ctrl => Some(Action::Quit),
             KeyCode::Char('n') if ctrl => Some(Action::NewGame),
             KeyCode::Char('r') if ctrl => Some(Action::RestartGame),
             KeyCode::Char('p') if ctrl => Some(Action::TogglePause),
@@ -856,11 +921,9 @@ impl App {
             KeyCode::Char('y') if ctrl => Some(Action::Redo),
             _ if ctrl => None,
             KeyCode::Char('q') => Some(Action::Quit),
-            KeyCode::Char('n') => Some(Action::NewGame),
             KeyCode::Char('p') | KeyCode::Esc | KeyCode::Pause => Some(Action::TogglePause),
-            KeyCode::Char('h') | KeyCode::Backspace => Some(Action::Hint),
-            KeyCode::Char('u') | KeyCode::Char('z') => Some(Action::Undo),
-            KeyCode::Char('U') | KeyCode::Char('Z') | KeyCode::Char('y') => Some(Action::Redo),
+            KeyCode::Char('u') => Some(Action::Undo),
+            KeyCode::Char('U') => Some(Action::Redo),
             KeyCode::Char('s') => Some(Action::Scores),
             KeyCode::Char('m') | KeyCode::F(10) => Some(Action::OpenMenu),
             KeyCode::F(1) => Some(Action::Rules),
@@ -879,10 +942,10 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Left => self.move_cursor(-1, 0),
-            KeyCode::Right => self.move_cursor(1, 0),
-            KeyCode::Up => self.move_cursor(0, -1),
-            KeyCode::Down => self.move_cursor(0, 1),
+            KeyCode::Left | KeyCode::Char('h') => self.move_cursor(-1, 0),
+            KeyCode::Right | KeyCode::Char('l') => self.move_cursor(1, 0),
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(0, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(0, 1),
             KeyCode::Tab => self.cycle_cursor(true),
             KeyCode::BackTab => self.cycle_cursor(false),
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -938,9 +1001,6 @@ impl App {
             KeyCode::Right if matches!(items.get(index), Some(MenuItem::Submenu { .. })) => {
                 self.menu_activate(index)
             }
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.perform(Action::Quit)
-            }
             _ => {}
         }
     }
@@ -981,9 +1041,12 @@ impl App {
                     self.perform(b.action);
                 }
             }
-            KeyCode::Esc => self.perform(Action::CloseDialog),
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.perform(Action::Quit)
+            KeyCode::Esc => {
+                if let Dialog::ClearScores { .. } = dialog.kind {
+                    self.perform(Action::CancelClearScores);
+                } else {
+                    self.perform(Action::CloseDialog);
+                }
             }
             _ => {}
         }
@@ -1023,5 +1086,209 @@ impl App {
             self.cursor = tile;
         }
         self.click_tile(tile, double);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn draw(app: &mut App) {
+        let mut term = Terminal::new(TestBackend::new(110, 42)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+    }
+
+    fn click(app: &mut App, r: Rect) {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x,
+            row: r.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn region(app: &App, action: &Action) -> Option<Rect> {
+        app.regions
+            .iter()
+            .find(|(_, a)| a == action)
+            .map(|(r, _)| *r)
+    }
+
+    fn play_first_move(app: &mut App) {
+        let (a, b) = app.game.solution[0];
+        app.click_tile(Some(a), false);
+        app.click_tile(Some(b), false);
+        assert_eq!(app.game.current_move(), 2);
+    }
+
+    #[test]
+    fn header_ignores_clicks_while_a_dialog_is_open() {
+        let mut app = App::new();
+        draw(&mut app);
+        let hint = region(&app, &Action::Hint).unwrap();
+        key(&mut app, KeyCode::F(1));
+        draw(&mut app);
+        assert!(region(&app, &Action::Hint).is_none());
+        click(&mut app, hint);
+        assert!(!app.game.started(), "no hint penalty through the dialog");
+        assert!(app.dialog.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_q_quit_from_anywhere() {
+        for open in [None, Some(KeyCode::Char('m')), Some(KeyCode::F(1))] {
+            for c in ['c', 'q'] {
+                let mut app = App::new();
+                if let Some(code) = open {
+                    key(&mut app, code);
+                }
+                ctrl(&mut app, c);
+                assert!(app.quit, "{open:?} ctrl+{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn bare_n_does_not_discard_the_game() {
+        let mut app = App::new();
+        let seed = app.game.seed;
+        key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.game.seed, seed);
+        ctrl(&mut app, 'n');
+        assert_ne!(app.game.seed, seed);
+    }
+
+    #[test]
+    fn clear_scores_returns_to_the_browsed_layout() {
+        let mut app = App::new();
+        app.history.add("easy", 100);
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Right);
+        let browsed = (app.map_index + 2) % app.maps.len();
+        let showing = |app: &App| match app.dialog.as_ref().map(|d| &d.kind) {
+            Some(Dialog::Scores { layout, .. }) => Some(*layout),
+            _ => None,
+        };
+        assert_eq!(showing(&app), Some(browsed));
+
+        app.perform(Action::ClearScores);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(showing(&app), Some(browsed), "cancel goes back");
+        assert_eq!(app.history.entries.len(), 1);
+
+        app.perform(Action::ClearScores);
+        app.perform(Action::ConfirmClearScores);
+        assert_eq!(showing(&app), Some(browsed));
+        assert!(app.history.entries.is_empty());
+    }
+
+    #[test]
+    fn hint_when_stuck_offers_reshuffle() {
+        let mut app = App::new();
+        play_first_move(&mut app);
+        for (i, t) in app.game.tiles.iter_mut().enumerate() {
+            t.visible = i < 2;
+        }
+        app.game.tiles[0].number = Some(0);
+        app.game.tiles[1].number = Some(4);
+        assert!(!app.game.can_move());
+        app.perform(Action::Hint);
+        assert!(matches!(
+            app.dialog.as_ref().map(|d| &d.kind),
+            Some(Dialog::NoMoves { can_shuffle: true })
+        ));
+    }
+
+    #[test]
+    fn every_move_is_saved_and_restored_with_its_layout() {
+        let mut app = App::new();
+        app.apply_layout(3);
+        assert!(
+            storage::load_save(&app.maps).is_none(),
+            "nothing to resume yet"
+        );
+        play_first_move(&mut app);
+        assert!(storage::load_save(&app.maps).is_some());
+
+        // Settings pointing elsewhere must not override the saved game's layout.
+        app.settings.layout = app.maps[0].name.clone();
+        app.save_settings();
+        let resumed = App::new();
+        assert!(resumed.restored && resumed.game.paused());
+        assert_eq!(resumed.map_index, 3);
+        assert_eq!(resumed.settings.layout, resumed.maps[3].name);
+    }
+
+    #[test]
+    fn menu_back_returns_to_the_submenu_entry() {
+        let mut app = App::new();
+        key(&mut app, KeyCode::Char('m'));
+        let items = app.menu_items(MenuPage::Main);
+        let appearance = items
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    MenuItem::Submenu {
+                        page: MenuPage::Appearance,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        app.perform(Action::MenuActivate(appearance));
+        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::Appearance);
+        key(&mut app, KeyCode::Esc);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!((menu.page, menu.index), (MenuPage::Main, appearance));
+    }
+
+    #[test]
+    fn autoplay_waits_while_paused_and_the_win_is_not_left_paused() {
+        let mut app = App::new();
+        for (a, b) in app.game.solution.clone() {
+            if app.game.all_tiles_unblocked() {
+                break;
+            }
+            app.game.remove_pair(a, b);
+        }
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.game.paused() && app.game.autoplaying());
+        let left = app.game.tiles.iter().filter(|t| t.visible).count();
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(250));
+            app.tick();
+        }
+        assert_eq!(app.game.tiles.iter().filter(|t| t.visible).count(), left);
+
+        key(&mut app, KeyCode::Esc);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !app.game.complete() && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.game.complete());
+        assert!(matches!(
+            app.dialog.as_ref().map(|d| &d.kind),
+            Some(Dialog::Scores {
+                completed: Some(_),
+                ..
+            })
+        ));
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.game.paused() && !app.pause_overlay_visible());
     }
 }

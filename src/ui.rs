@@ -109,6 +109,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.pause_overlay_visible() {
         draw_pause_overlay(buf, board, app, &ui);
     }
+    // Overlays are modal: only their own controls take clicks.
+    if app.overlay_open() {
+        app.regions.clear();
+    }
     if app.menu.is_some() {
         draw_menu(buf, area, app, &ui);
     }
@@ -144,7 +148,7 @@ fn header_button(
     let mut style = Style::default().bg(opt(ui.header)).fg(opt(ui.header_fg));
     if !enabled {
         style = style.fg(rgb(ui.dim_fg)).add_modifier(Modifier::DIM);
-    } else if hovered(app, rect) {
+    } else if !app.overlay_open() && hovered(app, rect) {
         style = style.bg(rgb(ui.button_hover));
     }
     let area = buf.area;
@@ -184,9 +188,14 @@ fn draw_header(buf: &mut Buffer, area: Rect, app: &mut App, ui: &UiPalette) {
     let can_undo = !paused && game.can_undo();
     let can_redo = !paused && game.can_redo();
     let moves_left = game.moves_left();
-    let can_hint = !paused && moves_left > 0;
+    let can_hint = app.can_hint();
     let can_pause = game.started() && !game.inspecting() && !game.complete();
-    let clock = format_clock(game.elapsed() as u64);
+    let clock = format_clock(game.elapsed().as_secs());
+    let subtitle = if game.inspecting() {
+        "Finished · Ctrl+N for a new game".to_string()
+    } else {
+        format!("Moves Left: {moves_left:2}")
+    };
 
     let y = area.y;
     let mut x = area.x as i32 + 1;
@@ -223,7 +232,6 @@ fn draw_header(buf: &mut Buffer, area: Rect, app: &mut App, ui: &UiPalette) {
 
     centered_text(buf, bar, y, &clock, base.add_modifier(Modifier::BOLD));
     if bar.height > 1 {
-        let subtitle = format!("Moves Left: {moves_left:2}");
         centered_text(buf, bar, y + 1, &subtitle, base.fg(rgb(ui.dim_fg)));
     }
 }
@@ -491,7 +499,7 @@ fn draw_menu(buf: &mut Buffer, area: Rect, app: &mut App, ui: &UiPalette) {
         width.min(area.width),
         height.min(area.height.saturating_sub(1)),
     );
-    if rect.height < 3 {
+    if rect.height < 3 || rect.width < 4 {
         return;
     }
     let bg = Style::default().bg(opt(ui.dialog)).fg(opt(ui.dialog_fg));
@@ -628,20 +636,20 @@ const SHORTCUTS: &[(&str, &str)] = &[
         "Double-click background",
         "Finish the game when all tiles are free",
     ),
-    ("Arrow keys", "Move the tile cursor"),
+    ("Arrow keys / H J K L", "Move the tile cursor"),
     ("Tab / Shift+Tab", "Jump between free tiles"),
     ("Enter / Space", "Select the tile under the cursor"),
     ("A", "Auto-finish when all tiles are free"),
-    ("Ctrl+N / N", "New game"),
+    ("Ctrl+N", "New game"),
     ("Ctrl+R", "Restart game"),
     ("Ctrl+Z / U", "Undo"),
     ("Ctrl+Y / Shift+U", "Redo"),
-    ("Ctrl+H / H", "Hint"),
+    ("Ctrl+H", "Hint (or reshuffle when stuck)"),
     ("Esc / P / Ctrl+P", "Pause / resume"),
     ("S", "Scores"),
     ("F10 / M", "Main menu"),
     ("F1", "Game rules"),
-    ("Ctrl+Q / Q", "Quit"),
+    ("Ctrl+Q / Ctrl+C / Q", "Quit (the game is saved)"),
 ];
 
 fn draw_dialog(buf: &mut Buffer, area: Rect, app: &mut App, ui: &UiPalette) {
@@ -657,7 +665,7 @@ fn draw_dialog(buf: &mut Buffer, area: Rect, app: &mut App, ui: &UiPalette) {
         Dialog::ChangeLayout(_) | Dialog::ClearScores { .. } => (48, 9),
         Dialog::Scores { .. } => (64, 22),
         Dialog::Rules => (78, 5 + RULES.len() as u16 * 2 + 3),
-        Dialog::Shortcuts => (70, 5 + SHORTCUTS.len() as u16 + 3),
+        Dialog::Shortcuts => (74, 5 + SHORTCUTS.len() as u16 + 3),
         Dialog::About => (60, 14),
     };
     let rect = centered(area, w, h);
@@ -888,6 +896,32 @@ mod tests {
     }
 
     #[test]
+    fn tiny_terminals_never_panic() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let overlays = [
+            None,
+            Some(KeyCode::Char('m')),
+            Some(KeyCode::Char('s')),
+            Some(KeyCode::F(1)),
+        ];
+        for open in overlays {
+            let mut app = App::new();
+            let (a, b) = app.game.solution[0];
+            app.game.remove_pair(a, b);
+            if let Some(code) = open {
+                app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            for w in 0..24 {
+                for h in 0..12 {
+                    let mut term =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| draw(f, &mut app)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn large_mode_used_when_room() {
         let maps = load_maps();
         let g = compute_geometry(&maps[0], Rect::new(0, 3, 200, 60)).unwrap();
@@ -966,13 +1000,8 @@ mod snapshot {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes HTML snapshots to $SNAPSHOT_DIR"]
     fn snapshot() {
-        let dir = std::env::var("SNAPSHOT_DIR").unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
-            std::env::set_var("XDG_DATA_HOME", &dir);
-        }
         let mut app = App::new();
         app.game.generate(Some(12345));
         shot(&mut app, 110, 42, "large");
@@ -1008,6 +1037,9 @@ mod snapshot {
         key(&mut app, KeyCode::Char('p'));
         shot(&mut app, 110, 42, "paused");
         key(&mut app, KeyCode::Char('p'));
+        key(&mut app, KeyCode::Char('?'));
+        shot(&mut app, 80, 24, "shortcuts");
+        key(&mut app, KeyCode::Esc);
 
         for (i, map) in app.maps.clone().iter().enumerate() {
             app.map_index = i;
@@ -1015,16 +1047,12 @@ mod snapshot {
             app.game.generate(Some(99));
             shot(&mut app, 110, 42, &format!("layout-{i}"));
         }
-        let (a, b) = (0..app.game.solution.len())
-            .map(|k| app.game.solution[k])
-            .next()
-            .unwrap();
-        let _ = (a, b);
         let solution = app.game.solution.clone();
         for (a, b) in solution {
             app.game.remove_pair(a, b);
         }
         app.history.add(&app.game.map.score_name, 312);
+        app.history.save().unwrap();
         app.perform(crate::app::Action::Scores);
         shot(&mut app, 110, 42, "scores");
     }

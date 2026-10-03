@@ -2,6 +2,8 @@
 //!
 //! Tiles are numbered 0..144; `number / 4` is the face, so tiles with the same
 //! face match (the four seasons share a face, as do the four flowers).
+//! Tiles with no number yet (`None`) all match each other, which is what the
+//! deal generator relies on while it searches for a removal order.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +21,8 @@ pub type Match = (usize, usize);
 
 #[derive(Clone, Debug)]
 pub struct Tile {
-    pub number: i32,
+    /// `None` until a face has been dealt.
+    pub number: Option<u8>,
     pub visible: bool,
     /// Move on which this tile was removed (0 = never / cleared redo history).
     pub mv: u32,
@@ -30,8 +33,71 @@ pub struct Tile {
 }
 
 impl Tile {
-    pub fn face(&self) -> i32 {
-        self.number / 4
+    pub fn face(&self) -> Option<u8> {
+        self.number.map(|n| n / 4)
+    }
+}
+
+/// The saved state of one tile, used to resume a game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileState {
+    pub slot: Slot,
+    pub number: u8,
+    pub visible: bool,
+    pub mv: u32,
+}
+
+/// Game clock. Penalties are added to the accumulated time.
+#[derive(Clone, Copy, Debug)]
+enum Clock {
+    NotStarted,
+    Stopped(Duration),
+    Running { base: Duration, since: Instant },
+}
+
+impl Clock {
+    fn elapsed(self) -> Duration {
+        match self {
+            Clock::NotStarted => Duration::ZERO,
+            Clock::Stopped(d) => d,
+            Clock::Running { base, since } => base + since.elapsed(),
+        }
+    }
+
+    fn start(&mut self) {
+        if let Clock::NotStarted = self {
+            *self = Clock::Running {
+                base: Duration::ZERO,
+                since: Instant::now(),
+            };
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Clock::Running { .. } = self {
+            *self = Clock::Stopped(self.elapsed());
+        }
+    }
+
+    fn resume(&mut self) {
+        match *self {
+            Clock::NotStarted => self.start(),
+            Clock::Stopped(base) => {
+                *self = Clock::Running {
+                    base,
+                    since: Instant::now(),
+                }
+            }
+            Clock::Running { .. } => {}
+        }
+    }
+
+    /// Start the clock if needed and add a time penalty.
+    fn penalize(&mut self, penalty: Duration) {
+        self.start();
+        if let Clock::Stopped(base) | Clock::Running { base, .. } = self {
+            *base += penalty;
+        }
     }
 }
 
@@ -45,9 +111,7 @@ pub struct Game {
     hint_matches: Vec<Match>,
     hint_index: usize,
     hint_started: Option<Instant>,
-    clock_elapsed: f64,
-    clock_started: bool,
-    clock_running: Option<Instant>,
+    clock: Clock,
     paused: bool,
     inspecting: bool,
     current_move: u32,
@@ -63,7 +127,7 @@ impl Game {
             .slots
             .iter()
             .map(|&slot| Tile {
-                number: -1,
+                number: None,
                 visible: true,
                 mv: 0,
                 slot,
@@ -106,9 +170,7 @@ impl Game {
             hint_matches: vec![],
             hint_index: 0,
             hint_started: None,
-            clock_elapsed: 0.0,
-            clock_started: false,
-            clock_running: None,
+            clock: Clock::NotStarted,
             paused: false,
             inspecting: false,
             current_move: 1,
@@ -124,7 +186,7 @@ impl Game {
     pub fn generate(&mut self, seed: Option<u64>) {
         self.seed = seed.unwrap_or_else(random_seed);
         self.paused = false;
-        self.reset_clock();
+        self.clock = Clock::NotStarted;
         self.set_selected(None);
         self.set_hint(None);
         self.current_move = 1;
@@ -132,13 +194,14 @@ impl Game {
         self.shake = None;
         self.autoplay = None;
         for t in &mut self.tiles {
-            t.number = -1;
+            t.number = None;
             t.visible = true;
             t.mv = 0;
         }
 
-        let n_pairs = self.tiles.len() / 2;
-        let pair_numbers: Vec<i32> = (0..n_pairs as i32).map(|i| i * 2).collect();
+        // Maps hold at most 144 tiles, so pair numbers fit in a u8.
+        let n_pairs = (self.tiles.len() / 2) as u8;
+        let pair_numbers: Vec<u8> = (0..n_pairs).map(|i| i * 2).collect();
         self.rng = Rng::new(self.seed);
         let pair_numbers = self.shuffle_pair_numbers(pair_numbers);
         self.choose_tile_pairs(&pair_numbers);
@@ -154,36 +217,28 @@ impl Game {
     }
 
     /// Restore a saved game (tile numbers/visibility/moves, clock). Starts paused.
-    pub fn restore(
-        &mut self,
-        seed: u64,
-        current_move: u32,
-        clock: f64,
-        tiles: &[(Slot, i32, bool, u32)],
-    ) {
+    pub fn restore(&mut self, seed: u64, current_move: u32, clock: Duration, tiles: &[TileState]) {
         self.seed = seed;
         self.rng = Rng::new(seed);
         self.current_move = current_move.max(1);
         for tile in &mut self.tiles {
-            if let Some(&(_, number, visible, mv)) = tiles.iter().find(|(s, ..)| *s == tile.slot) {
-                tile.number = number;
-                tile.visible = visible;
-                tile.mv = mv;
+            if let Some(saved) = tiles.iter().find(|s| s.slot == tile.slot) {
+                tile.number = Some(saved.number);
+                tile.visible = saved.visible;
+                tile.mv = saved.mv;
             }
         }
-        self.clock_started = true;
-        self.clock_running = None;
-        self.clock_elapsed = clock;
+        self.clock = Clock::Stopped(clock);
         self.paused = true;
     }
 
     pub fn is_valid_deal(&self) -> bool {
         let mut counts = [0; 36];
         for t in &self.tiles {
-            if !(0..144).contains(&t.number) {
-                return false;
+            match t.number {
+                Some(n) if n < 144 => counts[usize::from(n / 4)] += 1,
+                _ => return false,
             }
-            counts[t.face() as usize] += 1;
         }
         counts.iter().all(|c| c % 2 == 0)
     }
@@ -254,7 +309,7 @@ impl Game {
     }
 
     pub fn started(&self) -> bool {
-        self.clock_started
+        !matches!(self.clock, Clock::NotStarted)
     }
 
     pub fn inspecting(&self) -> bool {
@@ -265,14 +320,8 @@ impl Game {
         self.paused
     }
 
-    pub fn elapsed(&self) -> f64 {
-        if !self.clock_started {
-            return 0.0;
-        }
-        self.clock_elapsed
-            + self
-                .clock_running
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
+    pub fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -329,9 +378,9 @@ impl Game {
         }
         self.paused = paused;
         if paused {
-            self.stop_clock();
+            self.clock.stop();
         } else {
-            self.continue_clock();
+            self.clock.resume();
         }
         self.set_selected(None);
         self.set_hint(None);
@@ -362,11 +411,11 @@ impl Game {
         self.current_move += 1;
 
         if self.complete() {
-            self.stop_clock();
+            self.clock.stop();
             self.inspecting = true;
             self.autoplay = None;
         } else {
-            self.start_clock();
+            self.clock.start();
         }
         true
     }
@@ -377,6 +426,7 @@ impl Game {
         }
         self.set_selected(None);
         self.set_hint(None);
+        self.autoplay = None;
         self.current_move -= 1;
         let current = self.current_move;
         for t in &mut self.tiles {
@@ -392,6 +442,7 @@ impl Game {
         }
         self.set_selected(None);
         self.set_hint(None);
+        self.autoplay = None;
         let current = self.current_move;
         for t in &mut self.tiles {
             if t.mv == current {
@@ -417,22 +468,26 @@ impl Game {
             t.mv = 0;
             if t.visible {
                 to_shuffle.push(i);
-            } else if !removed_faces.contains(&t.face()) {
-                removed_faces.push(t.face());
+            } else if let Some(face) = t.face()
+                && !removed_faces.contains(&face)
+            {
+                removed_faces.push(face);
             }
         }
 
         let mut pair_numbers = vec![];
         for &i in &to_shuffle {
-            let t = &mut self.tiles[i];
-            let face = t.face();
-            let mut pair_number = t.number - (t.number % 2);
-            t.number = -1;
+            let Some(number) = self.tiles[i].number.take() else {
+                continue;
+            };
+            let face = number / 4;
             // If one pair of this face was already removed, the two survivors
             // may come from different original pairs; merge them into one.
-            if removed_faces.contains(&face) {
-                pair_number = face * 4;
-            }
+            let pair_number = if removed_faces.contains(&face) {
+                face * 4
+            } else {
+                number - number % 2
+            };
             if !pair_numbers.contains(&pair_number) {
                 pair_numbers.push(pair_number);
             }
@@ -444,8 +499,7 @@ impl Game {
             self.tiles[i].visible = true;
         }
 
-        self.start_clock();
-        self.clock_elapsed += 60.0;
+        self.clock.penalize(Duration::from_secs(60));
     }
 
     pub fn next_hint(&mut self) -> Option<Match> {
@@ -492,7 +546,9 @@ impl Game {
         {
             self.shake = None;
         }
-        if let Some(last) = self.autoplay
+        // Autoplay waits while the game is paused (menus and dialogs pause it too).
+        if !self.paused
+            && let Some(last) = self.autoplay
             && last.elapsed() >= AUTOPLAY_INTERVAL
         {
             match self.next_hint() {
@@ -521,11 +577,10 @@ impl Game {
         if self.inspecting {
             return;
         }
-        self.start_clock();
-        self.clock_elapsed += 30.0;
+        self.clock.penalize(Duration::from_secs(30));
     }
 
-    fn shuffle_pair_numbers(&mut self, mut numbers: Vec<i32>) -> Vec<i32> {
+    fn shuffle_pair_numbers(&mut self, mut numbers: Vec<u8>) -> Vec<u8> {
         for i in 0..numbers.len() {
             let n = self.rng.range(i, numbers.len());
             numbers.swap(i, n);
@@ -533,7 +588,7 @@ impl Game {
         numbers
     }
 
-    fn choose_tile_pairs(&mut self, pair_numbers: &[i32]) {
+    fn choose_tile_pairs(&mut self, pair_numbers: &[u8]) {
         self.solution.clear();
         for _attempt in 0..20 {
             let mut budget = SEARCH_BUDGET;
@@ -552,7 +607,7 @@ impl Game {
 
     fn search_pairs(
         &mut self,
-        pair_numbers: &[i32],
+        pair_numbers: &[u8],
         depth: usize,
         check_selectable: bool,
         budget: &mut u32,
@@ -577,8 +632,8 @@ impl Game {
             self.tiles[b].visible = false;
             path.push((a, b));
             if self.search_pairs(pair_numbers, depth + 1, check_selectable, budget, path) {
-                self.tiles[a].number = pair_numbers[depth];
-                self.tiles[b].number = pair_numbers[depth] + 1;
+                self.tiles[a].number = Some(pair_numbers[depth]);
+                self.tiles[b].number = Some(pair_numbers[depth] + 1);
                 return true;
             }
             path.pop();
@@ -621,33 +676,6 @@ impl Game {
             .map(|t| (t, tile))
             .collect()
     }
-
-    fn start_clock(&mut self) {
-        if self.clock_started {
-            return;
-        }
-        self.clock_started = true;
-        self.clock_running = Some(Instant::now());
-    }
-
-    fn stop_clock(&mut self) {
-        if let Some(start) = self.clock_running.take() {
-            self.clock_elapsed += start.elapsed().as_secs_f64();
-        }
-    }
-
-    fn continue_clock(&mut self) {
-        self.clock_started = true;
-        if self.clock_running.is_none() {
-            self.clock_running = Some(Instant::now());
-        }
-    }
-
-    fn reset_clock(&mut self) {
-        self.clock_started = false;
-        self.clock_running = None;
-        self.clock_elapsed = 0.0;
-    }
 }
 
 #[cfg(test)]
@@ -669,7 +697,7 @@ mod tests {
                 assert!(game.is_valid_deal(), "map {map_index} seed {seed}");
                 let mut counts = [0; 36];
                 for t in &game.tiles {
-                    counts[t.face() as usize] += 1;
+                    counts[usize::from(t.face().unwrap())] += 1;
                 }
                 assert!(counts.iter().all(|&c| c == 4));
 
@@ -743,7 +771,7 @@ mod tests {
         }
         let before = game.elapsed();
         game.shuffle_remaining();
-        assert!(game.elapsed() >= before + 60.0);
+        assert!(game.elapsed() >= before + Duration::from_secs(60));
         assert!(game.is_valid_deal());
         assert_eq!(game.tiles_left(), 104);
         for (a, b) in game.solution.clone() {
@@ -758,7 +786,7 @@ mod tests {
         assert!(!game.started());
         game.show_hint();
         assert!(game.started());
-        assert!(game.elapsed() >= 30.0);
+        assert!(game.elapsed() >= Duration::from_secs(30));
         let (a, b) = game.hint_match.unwrap();
         assert!(game.matches(a, b) && game.selectable(a) && game.selectable(b));
     }
@@ -776,5 +804,27 @@ mod tests {
         }
         assert_eq!(game.moves_left(), expected);
         assert!(expected > 0);
+    }
+
+    #[test]
+    fn autoplay_waits_while_paused_and_undo_cancels_it() {
+        let mut game = new_game(0, 3);
+        for &(a, b) in &game.solution.clone() {
+            if game.all_tiles_unblocked() {
+                break;
+            }
+            game.remove_pair(a, b);
+        }
+        game.autoplay_end_game();
+        assert!(game.tick(), "first pair goes immediately");
+        game.set_paused(true);
+        game.autoplay = Some(Instant::now() - AUTOPLAY_INTERVAL);
+        let left = game.tiles_left();
+        assert!(!game.tick());
+        assert_eq!(game.tiles_left(), left, "no tiles removed while paused");
+
+        game.set_paused(false);
+        game.undo();
+        assert!(!game.autoplaying(), "undo stops autoplay");
     }
 }

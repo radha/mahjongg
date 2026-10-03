@@ -19,12 +19,14 @@ cargo run --release
 - **Penalties**: a hint adds 30 seconds and a reshuffle adds 60, the same as GNOME.
   Undo and redo are free.
 - **Pause** hides the tile faces. Opening a menu or dialog pauses the game automatically.
-- **"No Moves Left" dialog** offers Quit / New Game / Reshuffle / Continue.
+- **"No Moves Left" dialog** offers Quit / New Game / Reshuffle / Continue. Pressing Hint
+  while stuck brings it back.
 - **Scores**: best times per layout, shown in a table after each win.
 - **Menu**: New Game, Restart Game, Scores, Layout, Layout Progression (none / sequential /
   random), Appearance (background Follow System / Light / Dark, and the
   Postmodern / Smooth / Educational tile themes), Game Rules, Keyboard Shortcuts, About.
-- **Unfinished games** are saved when you quit and restored (paused) on the next launch.
+- **Unfinished games** are saved after every move and restored (paused) on the next launch,
+  so closing the terminal loses nothing.
 - **Clicking a blocked tile** makes it shake. Double-clicking the background when every tile
   is free auto-finishes the game.
 
@@ -34,23 +36,26 @@ The game is fully playable with the mouse. On the keyboard:
 
 | Keys | Action |
 |---|---|
-| Arrow keys | Move the tile cursor |
+| Arrow keys, H J K L | Move the tile cursor |
 | Tab / Shift+Tab | Jump between free tiles |
 | Enter / Space | Select / match the tile under the cursor |
 | Ctrl+Z, U | Undo |
 | Ctrl+Y, Shift+U | Redo |
-| Ctrl+H, H | Hint |
+| Ctrl+H | Hint (reopens the reshuffle choices when stuck) |
 | Esc, P, Ctrl+P | Pause / resume |
-| Ctrl+N, N | New game |
+| Ctrl+N | New game |
 | Ctrl+R | Restart game |
 | S | Scores |
 | F10, M | Main menu |
 | F1 | Game rules |
 | ? | Keyboard shortcuts |
 | A | Auto-finish (when every tile is free) |
-| Ctrl+Q, Q | Quit (the game is saved) |
+| Ctrl+Q, Ctrl+C, Q | Quit (the game is saved) |
 
 ## Terminal requirements
+
+A modern terminal such as Ghostty, Kitty, WezTerm or iTerm2 is assumed: truecolor,
+mouse reporting, and standard widths for box-drawing and block characters.
 
 - The board is drawn at the largest size that fits. Large tiles need about 100×40 for
   Turtle. Compact tiles fit in 80×24.
@@ -63,6 +68,8 @@ The game is fully playable with the mouse. On the keyboard:
 
 - Settings: `$XDG_CONFIG_HOME/tui-mahjongg/settings` (default `~/.config`)
 - Scores and saved game: `$XDG_DATA_HOME/tui-mahjongg/` (default `~/.local/share`)
+
+Files are written atomically. If one can't be saved, the reason is printed when the game exits.
 
 ## License
 

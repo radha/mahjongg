@@ -301,17 +301,17 @@ pub enum Face {
     Blank,
 }
 
-pub fn face_for(number: i32) -> Face {
-    if number < 0 {
+pub fn face_for(number: Option<u8>) -> Face {
+    let Some(number) = number else {
         return Face::Blank;
-    }
+    };
     let set = number / 4;
-    let variant = (number % 4) as u8;
+    let variant = number % 4;
     match set {
-        0..=8 => Face::Dots(set as u8 + 1),
-        9..=17 => Face::Bamboo(set as u8 - 8),
-        18..=26 => Face::Characters(set as u8 - 17),
-        27..=30 => Face::Wind(set as u8 - 27),
+        0..=8 => Face::Dots(set + 1),
+        9..=17 => Face::Bamboo(set - 8),
+        18..=26 => Face::Characters(set - 17),
+        27..=30 => Face::Wind(set - 27),
         31 => Face::Dragon(0),
         32 => Face::Dragon(1),
         33 => Face::Season(variant),
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn all_faces_fit_inside_tile() {
         for number in 0..144 {
-            let face = face_for(number);
+            let face = face_for(Some(number));
             assert_ne!(face, Face::Blank);
             for theme in TileTheme::ALL {
                 for (c, r, s, _) in large_glyphs(face, theme) {
@@ -530,7 +530,7 @@ mod tests {
         for set in 0..36 {
             seen.insert(format!(
                 "{:?}",
-                large_glyphs(face_for(set * 4), TileTheme::Postmodern)
+                large_glyphs(face_for(Some(set * 4)), TileTheme::Postmodern)
             ));
         }
         assert_eq!(seen.len(), 36);
